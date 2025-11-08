@@ -16,10 +16,10 @@ def setup_driver():
     """Configura e retorna uma instância do WebDriver para o Firefox."""
     print("Configurando o driver do Firefox (usando o Selenium Manager)...")
     # Selenium 4.6+ gerencia o GeckoDriver automaticamente.
-    return webdriver.Firefox() # <-- ALTERAÇÃO PRINCIPAL
+    return webdriver.Firefox()
 
 
-# --- FUNÇÃO PARA EXTRAIR DADOS DE UMA EMPRESA ---
+# --- FUNÇÃO PARA EXTRAIR DADOS DE UMA EMPRESA (CORRIGIDA) ---
 def raspar_dados_empresa(url_empresa: str):
     """Raspa os dados de reputação de uma empresa no Reclame Aqui."""
     navegador = setup_driver()
@@ -27,21 +27,10 @@ def raspar_dados_empresa(url_empresa: str):
 
     wait = WebDriverWait(navegador, 15)
 
-    """
-    try:
-        print("Procurando o banner de cookies para aceitá-lo...")
-        botao_cookies = wait.until(EC.element_to_be_clickable((By.ID, "onetrust-accept-btn-handler")))
-        botao_cookies.click()
-        print("Banner de cookies fechado com sucesso.")
-        time.sleep(1)
-    except TimeoutException:
-        print("Banner de cookies não foi encontrado (provavelmente já foi aceito ou não existe).")
-    """
-
     periodos = {
         'seis_meses': 'newPerformanceCard-tab-1',
         'doze_meses': 'newPerformanceCard-tab-2',
-        'ano_2025': 'newPerformanceCard-tab-3', 
+        'ano_2025': 'newPerformanceCard-tab-3',
         'ano_2024': 'newPerformanceCard-tab-4',
         'geral': 'newPerformanceCard-tab-5'
     }
@@ -57,6 +46,25 @@ def raspar_dados_empresa(url_empresa: str):
             time.sleep(2)
 
             dados_periodo = {'periodo_nome': nome_periodo}
+
+            # --- TRECHO ADICIONADO PARA CAPTURAR A NOTA MÉDIA DA REPUTAÇÃO ---
+            try:
+                # O seletor busca pela tag <b> dentro do span que contém o texto "Sua nota média"
+                # Isso torna a busca mais robusta contra mudanças de classes dinâmicas.
+                seletor_nota_media = "div#ra-new-reputation span[class*='go'] > b[class*='go']"
+                elemento_nota = navegador.find_element(By.CSS_SELECTOR, seletor_nota_media)
+                nota_texto = elemento_nota.text
+                
+                # Extrai apenas o número da nota (ex: "8.7" de "8.7/10.")
+                nota_media_reputacao = re.search(r'[\d.,]+', nota_texto).group(0) if re.search(r'[\d.,]+', nota_texto) else "N/A"
+                dados_periodo['nota_media_reputacao'] = nota_media_reputacao
+                print(f"Nota de reputação encontrada: {nota_media_reputacao}")
+
+            except (NoSuchElementException, TimeoutException):
+                print("Nota de reputação principal não encontrada para este período.")
+                dados_periodo['nota_media_reputacao'] = "N/A"
+            # --- FIM DO TRECHO ADICIONADO ---
+
             blocos = navegador.find_elements(By.CSS_SELECTOR, "div.go4263471347")
 
             for bloco in blocos:
@@ -72,7 +80,8 @@ def raspar_dados_empresa(url_empresa: str):
                     dados_periodo["reclamacoes_aguardando"] = bloco.find_element(By.TAG_NAME, "strong").text
                 elif "avaliadas" in texto:
                     reclamacoes_avaliadas = bloco.find_element(By.TAG_NAME, "strong").text
-                    nota_match = re.search(r"nota média.*?([\d.,]+)", texto)
+                    # Expressão regular para encontrar a nota média dentro do texto
+                    nota_match = re.search(r"nota média.*?([\d.,]+)", texto, re.IGNORECASE)
                     nota_consumidor = nota_match.group(1) if nota_match else "N/A"
                     dados_periodo["num_avaliadas"] = reclamacoes_avaliadas
                     dados_periodo["nota_consumidor"] = nota_consumidor
@@ -104,8 +113,19 @@ def raspar_dados_empresa(url_empresa: str):
 
     agora = datetime.datetime.now()
     df_resumo['data_coleta'] = agora.date()
-    df_resumo['hora_coleta'] = agora.time()
+    df_resumo['hora_coleta'] = agora.time().strftime('%H:%M:%S')
 
+    # Reorganiza as colunas para melhor visualização
+    colunas_ordenadas = [
+        'periodo_nome', 'nota_media_reputacao', 'nota_consumidor', 'num_reclamacoes', 
+        'perc_recl_resp', 'indice_solucao', 'novam_negoc', 'num_avaliadas',
+        'reclamacoes_aguardando', 'tempo_medio_resposta', 'periodo_intervalo', 
+        'data_coleta', 'hora_coleta'
+    ]
+    # Filtra para incluir apenas as colunas que foram de fato coletadas
+    colunas_presentes = [col for col in colunas_ordenadas if col in df_resumo.columns]
+    df_resumo = df_resumo[colunas_presentes]
+    
     return df_resumo
 
 
@@ -137,5 +157,5 @@ if __name__ == "__main__":
 
     if not df_coletado.empty:
         print("\n--- Dados Coletados ---")
-        print(df_coletado)
+        print(df_coletado.to_string()) # Usar to_string() para exibir todas as colunas
         salvar_dados_excel(df_coletado, URL_ALVO)

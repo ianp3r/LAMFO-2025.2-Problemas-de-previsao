@@ -1,110 +1,82 @@
-# reclame_aqui_scraper.py
+# scraper.py
 
-import argparse
-import time
-import pandas as pd
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service as ChromeService
-from selenium.webdriver.firefox.service import Service as FirefoxService
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
-from webdriver_manager.chrome import ChromeDriverManager
-from webdriver_manager.firefox import GeckoDriverManager
+import requests
+from bs4 import BeautifulSoup
+import logging
+import constants
+from reclamacao import Reclamacao
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def create_driver(browser_choice):
-    if browser_choice.lower() == 'c':
-        options = webdriver.ChromeOptions()
-        options.add_argument("--headless")
-        service = ChromeService(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=options)
-    else:
-        options = webdriver.FirefoxOptions()
-        options.add_argument("--headless")
-        service = FirefoxService(GeckoDriverManager().install())
-        driver = webdriver.Firefox(service=service, options=options)
-    return driver
-
-
-def scrape_page(driver, page_url):
-    driver.get(page_url)
-    wait = WebDriverWait(driver, 10)
-
+def _fetch_html_with_zenrows(target_url: str):
+    """Faz uma requisição para a API do ZenRows e retorna o conteúdo HTML."""
+    params = {
+        "url": target_url,
+        "apikey": constants.ZENROWS_API_KEY,
+        "js_render": "true",  # Essencial para carregar conteúdo dinâmico
+    }
     try:
-        wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "article.sc-1pe7b5t-0")))
-    except TimeoutException:
-        print(f"[!] Timeout waiting for complaints to load on {page_url}")
-        return []
+        response = requests.get(constants.ZENROWS_URL, params=params, timeout=60)
+        response.raise_for_status()  # Lança exceção para códigos de erro (4xx ou 5xx)
+        return response.text
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Falha na requisição para a URL {target_url}: {e}")
+        return None
 
-    complaints = driver.find_elements(By.CSS_SELECTOR, "article.sc-1pe7b5t-0")
-    data = []
+def _get_text_from_soup(soup, selector):
+    """Função auxiliar para extrair texto de um elemento de forma segura."""
+    element = soup.select_one(selector)
+    return element.get_text(strip=True) if element else ""
 
-    for complaint in complaints:
-        try:
-            url = complaint.find_element(By.CSS_SELECTOR, "a").get_attribute("href")
-            content = complaint.find_element(By.CSS_SELECTOR, "p.sc-1pe7b5t-1").text
-            status = complaint.find_element(By.CSS_SELECTOR, "span.sc-1pe7b5t-4").text
-            date_loc = complaint.find_element(By.CSS_SELECTOR, "span.sc-1pe7b5t-3").text
-        except NoSuchElementException:
+def collect_complaint_urls(company_id: str, num_pages: int):
+    """Coleta as URLs de todas as reclamações das páginas de listagem."""
+    collected_urls = []
+    for page_num in range(1, num_pages + 1):
+        list_url = constants.COMPLAIN_LIST_BASE_URL.format(company_id, page_num)
+        logging.info(f"Coletando URLs da página {page_num}: {list_url}")
+        
+        html = _fetch_html_with_zenrows(list_url)
+        if not html:
+            logging.warning(f"Não foi possível obter o HTML da página {page_num}. Pulando.")
             continue
 
-        # Separate date and location if possible
-        if " - " in date_loc:
-            date, location = date_loc.split(" - ", 1)
-        else:
-            date, location = date_loc, ""
+        soup = BeautifulSoup(html, "html.parser")
+        links = soup.select(constants.COMPLAIN_URL_SELECTOR)
+        
+        if not links:
+            logging.info(f"Nenhuma reclamação encontrada na página {page_num}. Interrompendo coleta.")
+            break
 
-        # ✅ Now log the full URL, not just the ID
-        print(f"[LOG] Acessando: {url}")
+        for link in links:
+            href = link.get('href')
+            if href:
+                full_url = constants.BASE_URL + href if href.startswith('/') else href
+                collected_urls.append(full_url)
+    
+    return list(set(collected_urls)) # Remove duplicatas
 
-        data.append({
-            "URL": url,
-            "Content": content,
-            "Status": status,
-            "Date": date,
-            "Location": location
-        })
-    return data
+def scrape_complaint_details(complaint_url: str):
+    """Extrai os detalhes de uma única página de reclamação."""
+    logging.info(f"Extraindo dados de: {complaint_url}")
+    html = _fetch_html_with_zenrows(complaint_url)
+    if not html:
+        return None
 
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-i", "--institution", required=True, help="Company name (slug)")
-    parser.add_argument("-p", "--pages", type=int, default=1, help="Number of pages to scrape (max 50)")
-    parser.add_argument("-f", "--file", default="output", help="Output Excel filename")
-    parser.add_argument("-b", "--browser", default="c", help="Browser: C (Chrome) or F (Firefox)")
-    args = parser.parse_args()
-
-    # Enforce page limit
-    args.pages = min(args.pages, 50)
-    base_url = f"https://www.reclameaqui.com.br/empresa/{args.institution}/lista-reclamacoes/?pagina="
-
-    driver = create_driver(args.browser)
-    all_data = []
+    soup = BeautifulSoup(html, "html.parser")
 
     try:
-        for page in range(1, args.pages + 1):
-            print(f"[+] Scraping page {page} ...")
-            url = base_url + str(page)
-            page_data = scrape_page(driver, url)
-            if not page_data:
-                print("[!] No complaints found — stopping.")
-                break
-            all_data.extend(page_data)
-            time.sleep(2)  # avoid overloading the site
-    finally:
-        driver.quit()
-
-    if all_data:
-        df = pd.DataFrame(all_data)
-        out_path = f"{args.file}.xlsx"
-        df.to_excel(out_path, index=False)
-        print(f"[✓] Saved {len(all_data)} complaints to {out_path}")
-    else:
-        print("[!] No data scraped.")
-
-
-if __name__ == "__main__":
-    main()
+        reclamacao_obj = Reclamacao(
+            url=complaint_url,
+            titulo=_get_text_from_soup(soup, constants.COMPLAIN_TITLE_SELECTOR),
+            texto=_get_text_from_soup(soup, constants.COMPLAIN_TEXT_SELECTOR),
+            status=_get_text_from_soup(soup, constants.COMPLAIN_STATUS_SELECTOR),
+            local=_get_text_from_soup(soup, constants.COMPLAIN_LOCAL_SELECTOR),
+            data_hora=_get_text_from_soup(soup, constants.COMPLAIN_DATE_SELECTOR),
+            problem_type=_get_text_from_soup(soup, constants.COMPLAIN_CATEGORY_3_SELECTOR),
+            product_type=_get_text_from_soup(soup, constants.COMPLAIN_CATEGORY_2_SELECTOR),
+            category=_get_text_from_soup(soup, constants.COMPLAIN_CATEGORY_1_SELECTOR)
+        )
+        return reclamacao_obj
+    except Exception as e:
+        logging.error(f"Erro ao extrair dados da URL {complaint_url}: {e}")
+        return None
