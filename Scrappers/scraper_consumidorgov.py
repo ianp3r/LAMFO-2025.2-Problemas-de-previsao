@@ -9,7 +9,6 @@ import pandas as pd
 import datetime
 import time
 import re
-import os
 # Lembre-se de instalar as dependências:
 # pip install pandas selenium openpyxl
 
@@ -21,9 +20,87 @@ def setup_driver():
     # Cada chamada cria uma nova instância
     return webdriver.Firefox()
 
+
+# --- FUNÇÃO PARA COLETAR AS EMPRESAS AUTOMATICAMENTE ---
+def coletar_empresas_automaticamente(url_listagem: str, limite: int | None = None):
+    """
+    Acessa a página de listagem e extrai pares (nome, url_do_perfil) das empresas.
+    Define o limite para controlar a quantidade retornada (None coleta todas encontradas).
+    """
+    XPATH_EMPRESAS = "//*[@id='conteudo-decorator']/div/div[3]/fieldset/div[1]/div[1]"
+
+    print(f"Buscando empresas automaticamente em {url_listagem}...")
+    navegador = setup_driver()
+    empresas = []
+
+    try:
+        navegador.get(url_listagem)
+        wait = WebDriverWait(navegador, 20)
+
+        container_empresas = wait.until(
+            EC.presence_of_element_located((By.XPATH, XPATH_EMPRESAS))
+        )
+
+        links = container_empresas.find_elements(
+            By.XPATH, ".//a[contains(@href, '/pages/empresa/') and contains(@href, '/perfil')]"
+        )
+
+        vistos = set()
+        for link in links:
+            nome = link.text.strip()
+            href = link.get_attribute("href")
+
+            if not nome or not href:
+                continue
+
+            if href in vistos:
+                continue
+
+            vistos.add(href)
+            empresas.append((nome, href))
+
+            if limite is not None and len(empresas) >= limite:
+                break
+
+        print(f"Total de empresas encontradas: {len(empresas)}")
+
+    except Exception as e:
+        print(f"❌ Erro ao coletar empresas automaticamente: {e}")
+
+    finally:
+        navegador.quit()
+        print("Navegador fechado após coletar empresas.")
+
+    return empresas
+
 # --- FUNÇÃO DE RASPAGEM (COM MAIS ROBUSTEZ) ---
+def extrair_nome_empresa(navegador):
+    """Tenta extrair o nome da empresa já com a página carregada."""
+    candidatos = [
+        (By.CSS_SELECTOR, "div.perfil-empresa h1"),
+        (By.CSS_SELECTOR, "h1.nome-empresa"),
+        (By.CSS_SELECTOR, "div#conteudo-decorator h1"),
+    ]
+
+    for by, seletor in candidatos:
+        try:
+            elemento = WebDriverWait(navegador, 5).until(
+                EC.presence_of_element_located((by, seletor))
+            )
+            texto = elemento.text.strip()
+            if texto:
+                return texto
+        except Exception:
+            continue
+
+    titulo = (navegador.title or "").strip()
+    if " - " in titulo:
+        return titulo.split(" - ")[0].strip() or None
+    return titulo or None
+
+
 def raspar_dados_consumidor(url_empresa: str):
-    """Raspa os dados de uma empresa no Consumidor.gov.br."""
+    """Raspa os dados de uma empresa no Consumidor.gov.br e retorna (df, nome_detectado)."""
     
     # 1. CRIA UM NOVO NAVEGADOR
     navegador = setup_driver()
@@ -35,6 +112,8 @@ def raspar_dados_consumidor(url_empresa: str):
 
         print("Aguardando o carregamento da página e dos indicadores...")
         wait.until(EC.visibility_of_element_located((By.CLASS_NAME, "abas-perfil")))
+
+        nome_empresa_detectado = extrair_nome_empresa(navegador)
 
         ano_atual = datetime.datetime.now().year
         ano_anterior = ano_atual - 1
@@ -104,7 +183,7 @@ def raspar_dados_consumidor(url_empresa: str):
 
     # --- Processamento do DataFrame (Fora do Try/Finally) ---
     if not dados_coletados:
-        return pd.DataFrame()
+        return pd.DataFrame(), nome_empresa_detectado
 
     df_resumo = pd.DataFrame(dados_coletados)
 
@@ -120,7 +199,7 @@ def raspar_dados_consumidor(url_empresa: str):
     colunas_presentes = [col for col in colunas_ordenadas if col in df_resumo.columns]
     df_resumo = df_resumo[colunas_presentes]
     
-    return df_resumo
+    return df_resumo, nome_empresa_detectado
 
 # --- 2. SEÇÃO DE LIMPEZA E PADRONIZAÇÃO DE DADOS ---
 
@@ -243,23 +322,27 @@ def main():
     """
     Função principal para executar o processo de coleta.
     """
-    
-    # --- MODIFIQUE AQUI A SUA LISTA DE EMPRESAS ---
-    # A lista é de tuplas (Nome da Empresa, URL do Perfil)
+    # Basta informar apenas os links das páginas de perfil das empresas.
     EMPRESAS_ALVO = [
-
-        ("Nubank", "https://www.consumidor.gov.br/pages/empresa/20150204000053619/perfil")
+        "https://www.consumidor.gov.br/pages/empresa/20150204000053619/perfil",
+        # Adicione mais links aqui
     ]
-    # -----------------------------------------------
 
     print(f"--- Iniciando processo para {len(EMPRESAS_ALVO)} empresas ---")
 
-    for nome_empresa, url_empresa in EMPRESAS_ALVO:
-        print(f"\n--- Iniciando coleta para: {nome_empresa} ({url_empresa}) ---")
+    for entrada in EMPRESAS_ALVO:
+        if isinstance(entrada, tuple) and len(entrada) == 2:
+            nome_manual, url_empresa = entrada
+        else:
+            nome_manual, url_empresa = None, entrada
+
+        print(f"\n--- Iniciando coleta para URL: {url_empresa} ---")
         
         try:
             # 1. Coleta (abre e fecha um navegador)
-            df_coletado = raspar_dados_consumidor(url_empresa)
+            df_coletado, nome_detectado = raspar_dados_consumidor(url_empresa)
+
+            nome_empresa = nome_manual or nome_detectado or "empresa_desconhecida"
 
             if not df_coletado.empty:
                 # 2. Limpeza
@@ -271,7 +354,7 @@ def main():
                 # 3. Salva
                 salvar_dados_excel(df_limpo, nome_empresa)
             else:
-                print(f"Nenhum dado foi coletado para {nome_empresa}")
+                print(f"Nenhum dado foi coletado para {url_empresa}")
         
         except Exception as e:
             print(f"❌ Erro crítico no loop principal para {nome_empresa}: {e}")
